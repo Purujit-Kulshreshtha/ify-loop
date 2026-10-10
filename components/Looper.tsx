@@ -586,21 +586,21 @@ export default function Looper({ projectId, source }: { projectId: string; sourc
       <header className="topbar editor-topbar">
         <div className="brand"><span className="brand-mark"><i /><i /><i /><i /></span><span>IFY/<b>LOOP</b></span></div>
         <div className="session-name"><span className="live-dot" />{projectName.toUpperCase()} <small>{saveStatus}</small></div>
-        <div className="editor-actions"><button onClick={() => void persistProject()}>SAVE</button><button onClick={() => void exportProject()}>EXPORT</button><button onClick={() => router.push("/")} aria-label="Back to projects">⌂</button></div>
+        <div className="editor-actions" data-tutorial="project-actions"><button onClick={() => void persistProject()}>SAVE</button><button onClick={() => void exportProject()}>EXPORT</button><button onClick={() => window.dispatchEvent(new Event("ifyloop-tutorial"))} aria-label="Learn to use IfyLoop">?</button><button data-tutorial="home-button" onClick={() => router.push("/")} aria-label="Back to projects">⌂</button></div>
       </header>
 
       <section className="transport" aria-label="Transport controls">
-        <button className={`play ${playing ? "active" : ""}`} onClick={togglePlay} aria-label={playing ? "Pause loop" : "Start loop"}><Icon name={playing ? "pause" : "play"} size={23} /></button>
-        <div className="tempo-control">
+        <button data-tutorial="play" className={`play ${playing ? "active" : ""}`} onClick={togglePlay} aria-label={playing ? "Pause loop" : "Start loop"}><Icon name={playing ? "pause" : "play"} size={23} /></button>
+        <div className="tempo-control" data-tutorial="tempo">
           <span className="control-label">TEMPO</span>
           <div className="tempo-value"><button onClick={() => setBpm(Math.max(40, bpm - 1))}>−</button><EditableNumber value={bpm} onCommit={setBpm} min={40} max={240} label="Tempo in BPM" suffix="BPM" className="tempo-edit" /><button onClick={() => setBpm(Math.min(240, bpm + 1))}>+</button></div>
         </div>
         <div className="divider" />
-        <label className="select-control"><span className="control-label">LOOP LENGTH</span><select value={bars} onChange={event => setBars(Number(event.target.value))} disabled={playing}><option value={1}>1 BAR</option><option value={2}>2 BARS</option><option value={4}>4 BARS</option><option value={8}>8 BARS</option><option value={16}>16 BARS</option></select></label>
+        <label className="select-control" data-tutorial="loop-length"><span className="control-label">LOOP LENGTH</span><select value={bars} onChange={event => setBars(Number(event.target.value))} disabled={playing}><option value={1}>1 BAR</option><option value={2}>2 BARS</option><option value={4}>4 BARS</option><option value={8}>8 BARS</option><option value={16}>16 BARS</option></select></label>
         <div className="divider" />
-        <div className="metro-control"><span className="control-label">METRONOME</span><div><button className={`toggle ${metronome ? "on" : ""}`} onClick={() => setMetronome(!metronome)} aria-label="Toggle metronome"><span /></button><Icon name="volume" /><input aria-label="Metronome volume" type="range" min="0" max="100" value={metroVolume} onChange={event => setMetroVolume(Number(event.target.value))} /></div></div>
+        <div className="metro-control" data-tutorial="metronome"><span className="control-label">METRONOME</span><div><button className={`toggle ${metronome ? "on" : ""}`} onClick={() => setMetronome(!metronome)} aria-label="Toggle metronome"><span /></button><Icon name="volume" /><input aria-label="Metronome volume" type="range" min="0" max="100" value={metroVolume} onChange={event => setMetroVolume(Number(event.target.value))} /></div></div>
         <div className="divider" />
-        <div className="latency-global"><span className="control-label">NEW TRACK LATENCY</span><div><button onClick={() => setGlobalLatency(value => clampLatency(value - LATENCY_STEP))} aria-label="Decrease global latency">−</button><EditableNumber value={globalLatency} onCommit={value => setGlobalLatency(clampLatency(value))} min={-LATENCY_LIMIT} max={LATENCY_LIMIT} label="New track latency in milliseconds" suffix="MS" signed className="latency-edit" /><button onClick={() => setGlobalLatency(value => clampLatency(value + LATENCY_STEP))} aria-label="Increase global latency">+</button></div></div>
+        <div className="latency-global" data-tutorial="latency"><span className="control-label">NEW TRACK LATENCY</span><div><button onClick={() => setGlobalLatency(value => clampLatency(value - LATENCY_STEP))} aria-label="Decrease global latency">−</button><EditableNumber value={globalLatency} onCommit={value => setGlobalLatency(clampLatency(value))} min={-LATENCY_LIMIT} max={LATENCY_LIMIT} label="New track latency in milliseconds" suffix="MS" signed className="latency-edit" /><button onClick={() => setGlobalLatency(value => clampLatency(value + LATENCY_STEP))} aria-label="Increase global latency">+</button></div></div>
       </section>
 
       <section className="workspace">
@@ -611,7 +611,7 @@ export default function Looper({ projectId, source }: { projectId: string; sourc
 
         <div className="timeline" aria-label={`Bar ${bar} of ${bars}`}><span style={{ width: `${loopProgress}%` }} /><div className="beat-dots">{[0,1,2,3].map(item => <i key={item} className={item === beat && playing ? "active" : ""} />)}</div></div>
 
-        <div className="track-list">
+        <div className="track-list" data-tutorial="tracks">
           {tracks.map((track, index) => {
             const empty = track.status === "empty";
             const muted = track.status === "muted" || track.status === "mute-queued";
