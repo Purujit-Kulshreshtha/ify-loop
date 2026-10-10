@@ -15,7 +15,7 @@ The versioned `project.json` manifest stores transport, latency, volume, mute, E
 
 ## Interactive tutorial
 
-First-time visitors are offered a 15-step guided tour that spotlights the real project and editor controls. It covers creating and reopening projects, folder linking, import/export, transport, tempo, loop length, metronome, recording, latency compensation, effects, and saving. The tour waits for required actions and continues across page navigation; progress and completion are stored locally. It can be replayed from the `?` button in the editor.
+First-time visitors are offered a 16-step guided tour that spotlights the real project and editor controls. It covers creating and reopening projects, folder linking, import/export, transport, tempo, loop length, metronome, recording, wired-headphone monitoring, latency compensation, effects, and saving. The tour waits for required actions and continues across page navigation; progress and completion are stored locally. It can be replayed from the `?` button in the editor.
 
 ## Run locally
 
