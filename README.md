@@ -2,6 +2,17 @@
 
 A browser-based live looping instrument built with Next.js and the Web Audio / MediaRecorder APIs.
 
+## Projects and local storage
+
+The home page is a local project library. New projects autosave into the browser's Origin Private File System unless a projects folder is linked, in which case new projects and their WAV files are written there instead.
+
+- `Link Projects Folder` remembers the selected directory handle in IndexedDB and its display configuration in localStorage. Browsers may occasionally require the folder permission to be renewed.
+- `Export` downloads a portable `.ifyloop` ZIP bundle containing `project.json` and an `audio/` directory of WAV files.
+- `Import .ifyloop` creates a new local copy of a portable project.
+- Project audio is decoded into working memory when the editor opens; a loading overlay is shown during that process.
+
+The versioned `project.json` manifest stores transport, latency, volume, mute, EQ, and reverb settings non-destructively. There is no server or cloud storage.
+
 ## Run locally
 
 ```bash
