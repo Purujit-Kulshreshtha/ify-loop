@@ -3,10 +3,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type TrackStatus = "empty" | "queued" | "recording" | "playing" | "muted" | "mute-queued" | "unmute-queued";
-type Track = { id: number; name: string; status: TrackStatus; blobUrl?: string; duration?: number };
+type Track = { id: number; name: string; status: TrackStatus; blobUrl?: string; duration?: number; latencyMs: number };
 
 const COLORS = ["#d8ff5f", "#ff7965", "#77d8ff", "#c5a1ff", "#ffca68", "#70e4b4", "#ff98cb", "#a8b6ff", "#e7f08a"];
 const INITIAL_TRACKS = 4;
+const LATENCY_STEP = 5;
+const LATENCY_LIMIT = 250;
 
 function Icon({ name, size = 18 }: { name: "play" | "pause" | "trash" | "plus" | "volume" | "mic"; size?: number }) {
   const paths = {
@@ -26,9 +28,11 @@ export default function Looper() {
   const [playing, setPlaying] = useState(false);
   const [metronome, setMetronome] = useState(true);
   const [metroVolume, setMetroVolume] = useState(64);
+  const [globalLatency, setGlobalLatency] = useState(0);
   const [beat, setBeat] = useState(0);
   const [bar, setBar] = useState(1);
-  const [tracks, setTracks] = useState<Track[]>(() => Array.from({ length: INITIAL_TRACKS }, (_, i) => ({ id: i + 1, name: `Track ${i + 1}`, status: "empty" })));
+  const [tracks, setTracks] = useState<Track[]>(() => Array.from({ length: INITIAL_TRACKS }, (_, i) => ({ id: i + 1, name: `Track ${i + 1}`, status: "empty", latencyMs: 0 })));
+  const [selectedTrack, setSelectedTrack] = useState<number | null>(null);
   const [deleteMode, setDeleteMode] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<number | null>(null);
   const [notice, setNotice] = useState("Press space to start the loop");
@@ -51,6 +55,13 @@ export default function Looper() {
   const beatSeconds = 60 / bpm;
   const barMs = beatSeconds * 4 * 1000;
   const loopMs = barMs * bars;
+
+  const clampLatency = useCallback((value: number) => Math.max(-LATENCY_LIMIT, Math.min(LATENCY_LIMIT, value)), []);
+
+  const playbackOffset = useCallback((latencyMs: number) => {
+    const elapsed = performance.now() - startTime.current;
+    return (((elapsed - latencyMs) % loopMs + loopMs) % loopMs) / 1000;
+  }, [loopMs]);
 
   const getContext = useCallback(() => {
     if (!audioContext.current) audioContext.current = new AudioContext();
@@ -96,16 +107,15 @@ export default function Looper() {
   }, [beat, getContext, metronome, metroVolume, playing]);
 
   const syncAudios = useCallback(() => {
-    const offset = ((performance.now() - startTime.current) % loopMs) / 1000;
     tracksRef.current.forEach(track => {
       const audio = audioEls.current.get(track.id);
       if (!audio || !track.blobUrl) return;
       audio.loop = true;
-      audio.currentTime = Math.min(offset, Math.max(0, (audio.duration || loopMs / 1000) - 0.02));
+      audio.currentTime = Math.min(playbackOffset(track.latencyMs), Math.max(0, (audio.duration || loopMs / 1000) - 0.02));
       audio.muted = track.status === "muted" || track.status === "mute-queued";
       void audio.play().catch(() => undefined);
     });
-  }, [loopMs]);
+  }, [loopMs, playbackOffset]);
 
   const togglePlay = useCallback(() => {
     getContext();
@@ -126,6 +136,17 @@ export default function Looper() {
   const updateTrack = useCallback((id: number, patch: Partial<Track>) => {
     setTracks(prev => prev.map(track => track.id === id ? { ...track, ...patch } : track));
   }, []);
+
+  const nudgeTrack = useCallback((id: number, direction: -1 | 1) => {
+    const track = tracksRef.current.find(item => item.id === id);
+    if (!track?.blobUrl) { setNotice(`Record Track ${id} before adjusting its latency`); return; }
+    const latencyMs = clampLatency(track.latencyMs + direction * LATENCY_STEP);
+    updateTrack(id, { latencyMs });
+    setSelectedTrack(id);
+    const audio = audioEls.current.get(id);
+    if (audio && playingRef.current) audio.currentTime = Math.min(playbackOffset(latencyMs), Math.max(0, (audio.duration || loopMs / 1000) - 0.02));
+    setNotice(`Track ${id} latency ${latencyMs > 0 ? "+" : ""}${latencyMs} ms`);
+  }, [clampLatency, loopMs, playbackOffset, updateTrack]);
 
   const queueMuteToggle = useCallback((id: number) => {
     const track = tracksRef.current.find(item => item.id === id);
@@ -168,9 +189,9 @@ export default function Looper() {
           const audio = new Audio(blobUrl);
           audio.loop = true;
           audioEls.current.set(id, audio);
-          updateTrack(id, { status: "playing", blobUrl, duration: loopMs / 1000 });
-          const offset = ((performance.now() - startTime.current) % loopMs) / 1000;
-          audio.currentTime = Math.min(offset, Math.max(0, loopMs / 1000 - 0.02));
+          updateTrack(id, { status: "playing", blobUrl, duration: loopMs / 1000, latencyMs: globalLatency });
+          setSelectedTrack(id);
+          audio.currentTime = Math.min(playbackOffset(globalLatency), Math.max(0, loopMs / 1000 - 0.02));
           void audio.play().catch(() => undefined);
           setNotice(`Track ${id} captured and looping`);
         };
@@ -183,14 +204,15 @@ export default function Looper() {
     } catch {
       setNotice("Microphone access is needed to record");
     }
-  }, [ensureMic, loopMs, nextBarDelay, queueMuteToggle, updateTrack]);
+  }, [ensureMic, globalLatency, loopMs, nextBarDelay, playbackOffset, queueMuteToggle, updateTrack]);
 
   const deleteTrack = useCallback((id: number) => {
     const old = tracksRef.current.find(item => item.id === id);
     if (old?.blobUrl) URL.revokeObjectURL(old.blobUrl);
     const audio = audioEls.current.get(id);
     if (audio) { audio.pause(); audioEls.current.delete(id); }
-    updateTrack(id, { status: "empty", blobUrl: undefined, duration: undefined });
+    updateTrack(id, { status: "empty", blobUrl: undefined, duration: undefined, latencyMs: 0 });
+    setSelectedTrack(current => current === id ? null : current);
     setDeleteTarget(null); setDeleteMode(false); setNotice(`Track ${id} cleared`);
   }, [updateTrack]);
 
@@ -224,12 +246,17 @@ export default function Looper() {
       if (event.key.toLowerCase() === "d") { setDeleteMode(true); setDeleteTarget(null); setNotice("Delete mode — choose a numbered track"); return; }
       if (event.key === "Escape") { setDeleteMode(false); setDeleteTarget(null); setNotice("Delete cancelled"); return; }
       if (event.key === "Enter" && deleteTarget) { deleteTrack(deleteTarget); return; }
+      if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && selectedTrack) {
+        event.preventDefault();
+        nudgeTrack(selectedTrack, event.key === "ArrowLeft" ? -1 : 1);
+        return;
+      }
       const number = Number(event.key);
       if (number >= 1 && number <= tracksRef.current.length) handleTrackAction(number);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [deleteTarget, deleteTrack, fullMute, handleTrackAction, togglePlay]);
+  }, [deleteTarget, deleteTrack, fullMute, handleTrackAction, nudgeTrack, selectedTrack, togglePlay]);
 
   useEffect(() => () => {
     stream.current?.getTracks().forEach(track => track.stop());
@@ -257,6 +284,8 @@ export default function Looper() {
         <label className="select-control"><span className="control-label">LOOP LENGTH</span><select value={bars} onChange={event => setBars(Number(event.target.value))} disabled={playing}><option value={1}>1 BAR</option><option value={2}>2 BARS</option><option value={4}>4 BARS</option><option value={8}>8 BARS</option><option value={16}>16 BARS</option></select></label>
         <div className="divider" />
         <div className="metro-control"><span className="control-label">METRONOME</span><div><button className={`toggle ${metronome ? "on" : ""}`} onClick={() => setMetronome(!metronome)} aria-label="Toggle metronome"><span /></button><Icon name="volume" /><input aria-label="Metronome volume" type="range" min="0" max="100" value={metroVolume} onChange={event => setMetroVolume(Number(event.target.value))} /></div></div>
+        <div className="divider" />
+        <div className="latency-global"><span className="control-label">NEW TRACK LATENCY</span><div><button onClick={() => setGlobalLatency(value => clampLatency(value - LATENCY_STEP))} aria-label="Decrease global latency">−</button><strong>{globalLatency > 0 ? "+" : ""}{globalLatency}</strong><small>MS</small><button onClick={() => setGlobalLatency(value => clampLatency(value + LATENCY_STEP))} aria-label="Increase global latency">+</button></div></div>
       </section>
 
       <section className="workspace">
@@ -273,11 +302,12 @@ export default function Looper() {
             const muted = track.status === "muted" || track.status === "mute-queued";
             const queued = track.status.includes("queued");
             return (
-              <article className={`track ${empty ? "empty" : "filled"} ${muted ? "is-muted" : ""}`} key={track.id} style={{ "--track-color": COLORS[index] } as React.CSSProperties}>
+              <article className={`track ${empty ? "empty" : "filled"} ${muted ? "is-muted" : ""} ${selectedTrack === track.id ? "selected" : ""}`} key={track.id} style={{ "--track-color": COLORS[index] } as React.CSSProperties} onClick={() => { if (!empty) setSelectedTrack(track.id); }}>
                 <button className="track-key" onClick={() => handleTrackAction(track.id)} aria-label={`${empty ? "Record" : "Mute or unmute"} Track ${track.id}`}>{track.id}</button>
                 <div className="track-info"><strong>{track.name}</strong><span>{track.status === "empty" ? "READY TO RECORD" : track.status.replace("-", " ").toUpperCase()}</span></div>
                 <div className="waveform" aria-hidden>{Array.from({ length: 52 }, (_, i) => <i key={i} style={{ height: empty ? 2 : `${18 + ((i * 17 + track.id * 11) % 42)}%` }} />)}</div>
                 {queued && <span className="queued-pill">NEXT BAR</span>}
+                {!empty && !queued && <div className="track-latency" aria-label={`Track ${track.id} latency`}><button onClick={() => nudgeTrack(track.id, -1)} aria-label={`Shift Track ${track.id} backward 5 milliseconds`}>−</button><span>{track.latencyMs > 0 ? "+" : ""}{track.latencyMs}<small>ms</small></span><button onClick={() => nudgeTrack(track.id, 1)} aria-label={`Shift Track ${track.id} forward 5 milliseconds`}>+</button></div>}
                 {!empty && <button className="mini-delete" onClick={() => { setDeleteMode(true); setDeleteTarget(track.id); }} aria-label={`Delete Track ${track.id}`}><Icon name="trash" size={17} /></button>}
                 <button className={`track-action ${track.status === "recording" ? "recording" : ""}`} onClick={() => handleTrackAction(track.id)}><span />{empty || track.status === "queued" || track.status === "recording" ? "REC" : muted ? "UNMUTE" : "MUTE"}</button>
               </article>
@@ -285,12 +315,12 @@ export default function Looper() {
           })}
         </div>
 
-        {tracks.length < 9 && <button className="add-track" onClick={() => setTracks(prev => [...prev, { id: prev.length + 1, name: `Track ${prev.length + 1}`, status: "empty" }])}><Icon name="plus" /> ADD TRACK <span>{tracks.length}/9</span></button>}
+        {tracks.length < 9 && <button className="add-track" onClick={() => setTracks(prev => [...prev, { id: prev.length + 1, name: `Track ${prev.length + 1}`, status: "empty", latencyMs: 0 }])}><Icon name="plus" /> ADD TRACK <span>{tracks.length}/9</span></button>}
       </section>
 
       <footer>
         <div className="status"><span className={playing ? "pulse" : ""} />{notice}</div>
-        <div className="shortcuts"><span><kbd>SPACE</kbd> PLAY / PAUSE</span><span><kbd>1–9</kbd> REC / MUTE</span><span><kbd>M</kbd> FULL MUTE</span><span><kbd>D</kbd> DELETE</span></div>
+        <div className="shortcuts"><span><kbd>SPACE</kbd> PLAY / PAUSE</span><span><kbd>1–9</kbd> REC / MUTE</span><span><kbd>← →</kbd> LATENCY</span><span><kbd>M</kbd> FULL MUTE</span><span><kbd>D</kbd> DELETE</span></div>
         <span className="mic-status"><Icon name="mic" size={15} /> {micReady ? "MIC READY" : "MIC ON RECORD"}</span>
       </footer>
 
