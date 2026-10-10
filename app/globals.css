@@ -1,4 +1,4 @@
-:root { --ink:#e9ecdf; --muted:#7f877d; --panel:#181d1b; --line:#2a302d; --acid:#d8ff5f; --bg:#0d100f; color-scheme:dark; }
+:root { --ink:#e9ecdf; --muted:#7f877d; --panel:#181d1b; --line:#2a302d; --acid:#d8ff5f; --bg:#0d100f; --font-sans:"Avenir Next","Segoe UI",Arial,sans-serif; --font-mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace; color-scheme:dark; }
 * { box-sizing:border-box; }
 html,body { margin:0; min-height:100%; background:var(--bg); color:var(--ink); font-family:var(--font-sans),sans-serif; }
 button,select,input { font:inherit; }
