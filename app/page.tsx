@@ -3,8 +3,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type TrackStatus = "empty" | "queued" | "recording" | "playing" | "muted" | "mute-queued" | "unmute-queued";
-type Track = { id: number; name: string; status: TrackStatus; hasRecording: boolean; duration?: number; latencyMs: number };
-type PlaybackNode = { source: AudioBufferSourceNode; gain: GainNode };
+type Track = { id: number; name: string; status: TrackStatus; hasRecording: boolean; duration?: number; latencyMs: number; volume: number; eq: number[]; reverb: number };
+type PlaybackNode = { source: AudioBufferSourceNode; volume: GainNode; eq: BiquadFilterNode[]; mute: GainNode; dry: GainNode; convolver: ConvolverNode; wet: GainNode };
 type PcmChunk = { at: number; channels: Float32Array[] };
 type ActiveCapture = {
   trackId: number;
@@ -22,6 +22,9 @@ const INITIAL_TRACKS = 4;
 const LATENCY_STEP = 5;
 const LATENCY_LIMIT = 250;
 const CAPTURE_MARGIN_SECONDS = LATENCY_LIMIT / 1000;
+const EQ_BANDS = [60, 150, 400, 1000, 2400, 6000, 12000];
+
+const makeTrack = (id: number): Track => ({ id, name: `Track ${id}`, status: "empty", hasRecording: false, latencyMs: 0, volume: 100, eq: EQ_BANDS.map(() => 0), reverb: 0 });
 
 type EditableNumberProps = {
   value: number;
@@ -77,8 +80,9 @@ export default function Looper() {
   const [globalLatency, setGlobalLatency] = useState(0);
   const [beat, setBeat] = useState(0);
   const [bar, setBar] = useState(1);
-  const [tracks, setTracks] = useState<Track[]>(() => Array.from({ length: INITIAL_TRACKS }, (_, i) => ({ id: i + 1, name: `Track ${i + 1}`, status: "empty", hasRecording: false, latencyMs: 0 })));
+  const [tracks, setTracks] = useState<Track[]>(() => Array.from({ length: INITIAL_TRACKS }, (_, i) => makeTrack(i + 1)));
   const [selectedTrack, setSelectedTrack] = useState<number | null>(null);
+  const [effectsTrack, setEffectsTrack] = useState<number | null>(null);
   const [deleteMode, setDeleteMode] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<number | null>(null);
   const [notice, setNotice] = useState("Press space to start the loop");
@@ -92,7 +96,10 @@ export default function Looper() {
   const queuedTimers = useRef<Map<number, number>>(new Map());
   const audioBuffers = useRef<Map<number, AudioBuffer>>(new Map());
   const playbackNodes = useRef<Map<number, PlaybackNode>>(new Map());
+  const impulseResponse = useRef<AudioBuffer | null>(null);
   const activeCapture = useRef<ActiveCapture | null>(null);
+  const fullMuteActive = useRef(false);
+  const fullMuteRestore = useRef<Set<number>>(new Set());
   const tracksRef = useRef(tracks);
   const playingRef = useRef(playing);
 
@@ -109,6 +116,18 @@ export default function Looper() {
     if (!audioContext.current) audioContext.current = new AudioContext();
     void audioContext.current.resume();
     return audioContext.current;
+  }, []);
+
+  const getImpulseResponse = useCallback((ctx: AudioContext) => {
+    if (impulseResponse.current) return impulseResponse.current;
+    const duration = 2.4;
+    const buffer = ctx.createBuffer(2, Math.round(ctx.sampleRate * duration), ctx.sampleRate);
+    for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+      const data = buffer.getChannelData(channel);
+      for (let i = 0; i < data.length; i += 1) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / data.length, 2.7);
+    }
+    impulseResponse.current = buffer;
+    return buffer;
   }, []);
 
   const nextBarDelay = useCallback(() => {
@@ -155,7 +174,12 @@ export default function Looper() {
     if (!node) return;
     try { node.source.stop(); } catch { /* already stopped */ }
     node.source.disconnect();
-    node.gain.disconnect();
+    node.volume.disconnect();
+    node.eq.forEach(filter => filter.disconnect());
+    node.mute.disconnect();
+    node.dry.disconnect();
+    node.convolver.disconnect();
+    node.wet.disconnect();
     playbackNodes.current.delete(id);
   }, []);
 
@@ -170,16 +194,37 @@ export default function Looper() {
     const loopStart = CAPTURE_MARGIN_SECONDS - latencyMs / 1000;
     const phase = ((ctx.currentTime - audioStartTime.current) % loopSeconds + loopSeconds) % loopSeconds;
     const source = ctx.createBufferSource();
-    const gain = ctx.createGain();
+    const volume = ctx.createGain();
+    const eq = EQ_BANDS.map((frequency, index) => {
+      const filter = ctx.createBiquadFilter();
+      filter.type = "peaking";
+      filter.frequency.value = frequency;
+      filter.Q.value = 1.15;
+      filter.gain.value = track.eq[index];
+      return filter;
+    });
+    const mute = ctx.createGain();
+    const dry = ctx.createGain();
+    const convolver = ctx.createConvolver();
+    const wet = ctx.createGain();
     source.buffer = buffer;
     source.loop = true;
     source.loopStart = loopStart;
     source.loopEnd = loopStart + loopSeconds;
-    gain.gain.value = track.status === "muted" || track.status === "mute-queued" ? 0 : 1;
-    source.connect(gain).connect(ctx.destination);
+    volume.gain.value = track.volume / 100;
+    mute.gain.value = track.status === "muted" || track.status === "mute-queued" ? 0 : 1;
+    dry.gain.value = 1;
+    convolver.buffer = getImpulseResponse(ctx);
+    wet.gain.value = track.reverb / 100 * 0.75;
+    source.connect(volume);
+    let chain: AudioNode = volume;
+    eq.forEach(filter => { chain.connect(filter); chain = filter; });
+    chain.connect(mute);
+    mute.connect(dry).connect(ctx.destination);
+    mute.connect(convolver).connect(wet).connect(ctx.destination);
     source.start(0, loopStart + phase);
-    playbackNodes.current.set(id, { source, gain });
-  }, [getContext, loopMs, stopPlaybackNode]);
+    playbackNodes.current.set(id, { source, volume, eq, mute, dry, convolver, wet });
+  }, [getContext, getImpulseResponse, loopMs, stopPlaybackNode]);
 
   const syncAudios = useCallback(() => {
     tracksRef.current.forEach(track => { if (track.hasRecording) startTrackPlayback(track.id); });
@@ -210,6 +255,39 @@ export default function Looper() {
     });
   }, []);
 
+  const setTrackMutedNode = useCallback((id: number, muted: boolean) => {
+    const node = playbackNodes.current.get(id);
+    const ctx = audioContext.current;
+    if (!node || !ctx) return;
+    node.mute.gain.cancelScheduledValues(ctx.currentTime);
+    node.mute.gain.setValueAtTime(node.mute.gain.value, ctx.currentTime);
+    node.mute.gain.linearRampToValueAtTime(muted ? 0 : 1, ctx.currentTime + 0.015);
+  }, []);
+
+  const setTrackVolume = useCallback((id: number, value: number) => {
+    const volume = Math.max(0, Math.min(150, Math.round(value)));
+    updateTrack(id, { volume });
+    const node = playbackNodes.current.get(id);
+    if (node && audioContext.current) node.volume.gain.setTargetAtTime(volume / 100, audioContext.current.currentTime, 0.01);
+  }, [updateTrack]);
+
+  const setTrackEq = useCallback((id: number, band: number, value: number) => {
+    const track = tracksRef.current.find(item => item.id === id);
+    if (!track) return;
+    const gain = Math.max(-12, Math.min(12, Math.round(value)));
+    const eq = track.eq.map((current, index) => index === band ? gain : current);
+    updateTrack(id, { eq });
+    const node = playbackNodes.current.get(id);
+    if (node && audioContext.current) node.eq[band].gain.setTargetAtTime(gain, audioContext.current.currentTime, 0.01);
+  }, [updateTrack]);
+
+  const setTrackReverb = useCallback((id: number, value: number) => {
+    const reverb = Math.max(0, Math.min(100, Math.round(value)));
+    updateTrack(id, { reverb });
+    const node = playbackNodes.current.get(id);
+    if (node && audioContext.current) node.wet.gain.setTargetAtTime(reverb / 100 * 0.75, audioContext.current.currentTime, 0.02);
+  }, [updateTrack]);
+
   const nudgeTrack = useCallback((id: number, direction: -1 | 1) => {
     const track = tracksRef.current.find(item => item.id === id);
     if (!track?.hasRecording) { setNotice(`Record Track ${id} before adjusting its latency`); return; }
@@ -237,13 +315,12 @@ export default function Looper() {
     updateTrack(id, { status: willMute ? "mute-queued" : "unmute-queued" });
     setNotice(`${willMute ? "Mute" : "Unmute"} queued for Track ${id}`);
     const timer = window.setTimeout(() => {
-      const node = playbackNodes.current.get(id);
-      if (node) node.gain.gain.setValueAtTime(willMute ? 0 : 1, getContext().currentTime);
+      setTrackMutedNode(id, willMute);
       updateTrack(id, { status: willMute ? "muted" : "playing" });
       setNotice(`Track ${id} ${willMute ? "muted" : "playing"}`);
     }, nextBarDelay());
     queuedTimers.current.set(id, timer);
-  }, [getContext, nextBarDelay, updateTrack]);
+  }, [nextBarDelay, setTrackMutedNode, updateTrack]);
 
   const ensureMic = useCallback(async () => {
     if (!stream.current) stream.current = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
@@ -355,17 +432,23 @@ export default function Looper() {
     if (!playingRef.current) { setNotice("Start the loop before queuing a full mute"); return; }
     const occupied = tracksRef.current.filter(track => track.hasRecording);
     if (!occupied.length) { setNotice("There are no recorded tracks to mute"); return; }
-    occupied.forEach(track => updateTrack(track.id, { status: "mute-queued" }));
-    setNotice("Full mute queued for the next bar");
+    const restoring = fullMuteActive.current;
+    const affected = restoring
+      ? occupied.filter(track => fullMuteRestore.current.has(track.id))
+      : occupied.filter(track => track.status !== "muted" && track.status !== "mute-queued");
+    if (!restoring) fullMuteRestore.current = new Set(affected.map(track => track.id));
+    affected.forEach(track => updateTrack(track.id, { status: restoring ? "unmute-queued" : "mute-queued" }));
+    setNotice(`${restoring ? "Full unmute" : "Full mute"} queued for the next bar`);
     window.setTimeout(() => {
-      occupied.forEach(track => {
-        const node = playbackNodes.current.get(track.id);
-        if (node) node.gain.gain.setValueAtTime(0, getContext().currentTime);
-        updateTrack(track.id, { status: "muted" });
+      affected.forEach(track => {
+        setTrackMutedNode(track.id, !restoring);
+        updateTrack(track.id, { status: restoring ? "playing" : "muted" });
       });
-      setNotice("All tracks muted — loop is still running");
+      fullMuteActive.current = !restoring;
+      if (restoring) fullMuteRestore.current.clear();
+      setNotice(restoring ? "Previous tracks restored" : "All active tracks muted — effects are ringing out");
     }, nextBarDelay());
-  }, [getContext, nextBarDelay, updateTrack]);
+  }, [nextBarDelay, setTrackMutedNode, updateTrack]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -440,20 +523,29 @@ export default function Looper() {
             const muted = track.status === "muted" || track.status === "mute-queued";
             const queued = track.status.includes("queued");
             return (
-              <article className={`track ${empty ? "empty" : "filled"} ${muted ? "is-muted" : ""} ${selectedTrack === track.id ? "selected" : ""}`} key={track.id} style={{ "--track-color": COLORS[index] } as React.CSSProperties} onClick={() => { if (!empty) setSelectedTrack(track.id); }}>
-                <button className="track-key" onClick={() => handleTrackAction(track.id)} aria-label={`${empty ? "Record" : "Mute or unmute"} Track ${track.id}`}>{track.id}</button>
-                <div className="track-info"><strong>{track.name}</strong><span>{track.status === "empty" ? "READY TO RECORD" : track.status.replace("-", " ").toUpperCase()}</span></div>
-                <div className="waveform" aria-hidden>{Array.from({ length: 52 }, (_, i) => <i key={i} style={{ height: empty ? 2 : `${18 + ((i * 17 + track.id * 11) % 42)}%` }} />)}</div>
-                {queued && <span className="queued-pill">NEXT BAR</span>}
-                {!empty && !queued && <div className="track-latency" aria-label={`Track ${track.id} latency`}><button onClick={() => nudgeTrack(track.id, -1)} aria-label={`Shift Track ${track.id} backward 5 milliseconds`}>−</button><EditableNumber value={track.latencyMs} onCommit={value => setTrackLatency(track.id, value)} min={-LATENCY_LIMIT} max={LATENCY_LIMIT} label={`Track ${track.id} latency in milliseconds`} suffix="ms" signed className="track-latency-edit" /><button onClick={() => nudgeTrack(track.id, 1)} aria-label={`Shift Track ${track.id} forward 5 milliseconds`}>+</button></div>}
-                {!empty && <button className="mini-delete" onClick={() => { setDeleteMode(true); setDeleteTarget(track.id); }} aria-label={`Delete Track ${track.id}`}><Icon name="trash" size={17} /></button>}
-                <button className={`track-action ${track.status === "recording" ? "recording" : ""}`} onClick={() => handleTrackAction(track.id)}><span />{empty || track.status === "queued" || track.status === "recording" ? "REC" : muted ? "UNMUTE" : "MUTE"}</button>
-              </article>
+              <div className={`track-shell ${effectsTrack === track.id ? "effects-open" : ""}`} key={track.id} style={{ "--track-color": COLORS[index] } as React.CSSProperties}>
+                <article className={`track ${empty ? "empty" : "filled"} ${muted ? "is-muted" : ""} ${selectedTrack === track.id ? "selected" : ""}`} onClick={() => { if (!empty) setSelectedTrack(track.id); }}>
+                  <button className="track-key" onClick={() => handleTrackAction(track.id)} aria-label={`${empty ? "Record" : "Mute or unmute"} Track ${track.id}`}>{track.id}</button>
+                  <div className="track-info"><strong>{track.name}</strong><span>{track.status === "empty" ? "READY TO RECORD" : track.status.replace("-", " ").toUpperCase()}</span></div>
+                  <div className="waveform" aria-hidden>{Array.from({ length: 52 }, (_, i) => <i key={i} style={{ height: empty ? 2 : `${18 + ((i * 17 + track.id * 11) % 42)}%` }} />)}</div>
+                  <div className="track-volume"><div><span>VOL</span>{!empty && <EditableNumber value={track.volume} onCommit={value => setTrackVolume(track.id, value)} min={0} max={150} label={`Track ${track.id} volume percentage`} suffix="%" className="volume-edit" />}</div><input aria-label={`Track ${track.id} volume`} type="range" min="0" max="150" value={track.volume} disabled={empty} onChange={event => setTrackVolume(track.id, Number(event.target.value))} /></div>
+                  {queued && <span className="queued-pill">NEXT BAR</span>}
+                  {!empty && !queued && <div className="track-latency" aria-label={`Track ${track.id} latency`}><button onClick={() => nudgeTrack(track.id, -1)} aria-label={`Shift Track ${track.id} backward 5 milliseconds`}>−</button><EditableNumber value={track.latencyMs} onCommit={value => setTrackLatency(track.id, value)} min={-LATENCY_LIMIT} max={LATENCY_LIMIT} label={`Track ${track.id} latency in milliseconds`} suffix="ms" signed className="track-latency-edit" /><button onClick={() => nudgeTrack(track.id, 1)} aria-label={`Shift Track ${track.id} forward 5 milliseconds`}>+</button></div>}
+                  {!empty && <button className={`fx-button ${effectsTrack === track.id ? "active" : ""}`} onClick={() => setEffectsTrack(current => current === track.id ? null : track.id)} aria-label={`${effectsTrack === track.id ? "Close" : "Open"} effects for Track ${track.id}`}>FX</button>}
+                  {!empty && <button className="mini-delete" onClick={() => { setDeleteMode(true); setDeleteTarget(track.id); }} aria-label={`Delete Track ${track.id}`}><Icon name="trash" size={17} /></button>}
+                  <button className={`track-action ${track.status === "recording" ? "recording" : ""}`} onClick={() => handleTrackAction(track.id)}><span />{empty || track.status === "queued" || track.status === "recording" ? "REC" : muted ? "UNMUTE" : "MUTE"}</button>
+                </article>
+                {effectsTrack === track.id && track.hasRecording && <section className="effects-panel" aria-label={`Effects for Track ${track.id}`}>
+                  <div className="effects-title"><span>TRACK {track.id} / EFFECTS</span><small>Changes are live</small></div>
+                  <div className="eq-section"><span className="effect-label">7-BAND EQ</span><div className="eq-bands">{EQ_BANDS.map((frequency, band) => <label className="eq-band" key={frequency}><EditableNumber value={track.eq[band]} onCommit={value => setTrackEq(track.id, band, value)} min={-12} max={12} label={`Track ${track.id} ${frequency} hertz EQ gain`} suffix="dB" signed className="eq-edit" /><input aria-label={`Track ${track.id} ${frequency} hertz EQ`} type="range" min="-12" max="12" step="1" value={track.eq[band]} onChange={event => setTrackEq(track.id, band, Number(event.target.value))} /><span>{frequency >= 1000 ? `${frequency / 1000}k` : frequency}</span></label>)}</div></div>
+                  <div className="reverb-section"><span className="effect-label">REVERB</span><div><input aria-label={`Track ${track.id} reverb`} type="range" min="0" max="100" value={track.reverb} onChange={event => setTrackReverb(track.id, Number(event.target.value))} /><EditableNumber value={track.reverb} onCommit={value => setTrackReverb(track.id, value)} min={0} max={100} label={`Track ${track.id} reverb amount`} suffix="%" className="reverb-edit" /></div><small>2.4 SEC DECAY</small></div>
+                </section>}
+              </div>
             );
           })}
         </div>
 
-        {tracks.length < 9 && <button className="add-track" onClick={() => setTracks(prev => [...prev, { id: prev.length + 1, name: `Track ${prev.length + 1}`, status: "empty", hasRecording: false, latencyMs: 0 }])}><Icon name="plus" /> ADD TRACK <span>{tracks.length}/9</span></button>}
+        {tracks.length < 9 && <button className="add-track" onClick={() => setTracks(prev => [...prev, makeTrack(prev.length + 1)])}><Icon name="plus" /> ADD TRACK <span>{tracks.length}/9</span></button>}
       </section>
 
       <footer>

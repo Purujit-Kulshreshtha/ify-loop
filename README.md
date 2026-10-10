@@ -15,7 +15,7 @@ Open [http://localhost:3000](http://localhost:3000). Microphone access is reques
 
 - `Space`: start or pause the transport
 - `1`–`9`: arm an empty track, or queue mute/unmute for a recorded track
-- `M`: queue a full mute for the next bar
+- `M`: toggle full mute on the next bar; pressing it again restores the tracks that were active before the full mute
 - `D`, then a track number, then `Enter`: clear a recording
 - `←` / `→`: nudge the selected recorded track backward or forward by 5 ms
 - `Escape`: leave delete mode
@@ -27,6 +27,13 @@ Recording starts capturing raw Web Audio samples as soon as a track is armed. Th
 The global latency control sets the starting offset for every new recording. Each recorded track can then be selected and fine-tuned independently from −250 ms to +250 ms using its on-screen controls or the arrow keys.
 
 Click any displayed BPM or latency value to type an exact number, then press `Enter` or click away to apply it.
+
+## Track effects
+
+- Per-track volume runs from 0% to 150%.
+- The FX drawer provides seven EQ bands at 60 Hz, 150 Hz, 400 Hz, 1 kHz, 2.4 kHz, 6 kHz, and 12 kHz, each with ±12 dB of gain.
+- Reverb provides a 0–100% wet level with a 2.4-second decay. The reverb processor sits after the mute gate, so an existing tail continues naturally after the track is muted.
+- Effect values update the active Web Audio graph immediately and can also be typed directly.
 
 ## Checks
 
