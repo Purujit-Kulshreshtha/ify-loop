@@ -23,6 +23,39 @@ const LATENCY_STEP = 5;
 const LATENCY_LIMIT = 250;
 const CAPTURE_MARGIN_SECONDS = LATENCY_LIMIT / 1000;
 
+type EditableNumberProps = {
+  value: number;
+  onCommit: (value: number) => void;
+  min: number;
+  max: number;
+  label: string;
+  suffix?: string;
+  signed?: boolean;
+  className?: string;
+};
+
+function EditableNumber({ value, onCommit, min, max, label, suffix, signed = false, className = "" }: EditableNumberProps) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(String(value));
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editing) { setDraft(String(value)); inputRef.current?.select(); }
+  }, [editing, value]);
+
+  const commit = () => {
+    const parsed = Number(draft);
+    if (Number.isFinite(parsed)) onCommit(Math.max(min, Math.min(max, Math.round(parsed))));
+    setEditing(false);
+  };
+
+  if (editing) {
+    return <input ref={inputRef} className={`editable-number-input ${className}`} aria-label={label} type="number" inputMode="numeric" min={min} max={max} value={draft} onClick={event => event.stopPropagation()} onChange={event => setDraft(event.target.value)} onBlur={commit} onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); if (event.key === "Escape") setEditing(false); }} />;
+  }
+
+  return <button type="button" className={`editable-number ${className}`} aria-label={`${label}: ${value}. Click to edit`} onClick={event => { event.stopPropagation(); setEditing(true); }}><span>{signed && value > 0 ? "+" : ""}{value}</span>{suffix && <small>{suffix}</small>}</button>;
+}
+
 function Icon({ name, size = 18 }: { name: "play" | "pause" | "trash" | "plus" | "volume" | "mic"; size?: number }) {
   const paths = {
     play: <path d="m8 5 11 7-11 7V5Z" fill="currentColor" />,
@@ -187,6 +220,16 @@ export default function Looper() {
     setNotice(`Track ${id} latency ${latencyMs > 0 ? "+" : ""}${latencyMs} ms`);
   }, [clampLatency, startTrackPlayback, updateTrack]);
 
+  const setTrackLatency = useCallback((id: number, value: number) => {
+    const track = tracksRef.current.find(item => item.id === id);
+    if (!track?.hasRecording) return;
+    const latencyMs = clampLatency(value);
+    updateTrack(id, { latencyMs });
+    setSelectedTrack(id);
+    if (playingRef.current) startTrackPlayback(id, latencyMs);
+    setNotice(`Track ${id} latency ${latencyMs > 0 ? "+" : ""}${latencyMs} ms`);
+  }, [clampLatency, startTrackPlayback, updateTrack]);
+
   const queueMuteToggle = useCallback((id: number) => {
     const track = tracksRef.current.find(item => item.id === id);
     if (!track || !track.hasRecording) return;
@@ -219,12 +262,14 @@ export default function Looper() {
     const ctx = getContext();
     const sampleRate = ctx.sampleRate;
     const loopSeconds = loopMs / 1000;
-    const frameCount = Math.round((loopSeconds + CAPTURE_MARGIN_SECONDS * 2) * sampleRate);
+    const loopFrames = Math.round(loopSeconds * sampleRate);
+    const marginFrames = Math.round(CAPTURE_MARGIN_SECONDS * sampleRate);
+    const frameCount = loopFrames + marginFrames * 2;
     const channelCount = capture.chunks[0]?.channels.length || 1;
     const buffer = ctx.createBuffer(channelCount, frameCount, sampleRate);
     const totalFrames = capture.chunks.reduce((sum, chunk) => sum + chunk.channels[0].length, 0);
     const firstTime = capture.chunks[0]?.at ?? capture.targetTime;
-    const sourceStart = Math.round((capture.targetTime - CAPTURE_MARGIN_SECONDS - firstTime) * sampleRate);
+    const sourceStart = Math.round((capture.targetTime - firstTime) * sampleRate);
 
     for (let channel = 0; channel < channelCount; channel += 1) {
       const flattened = new Float32Array(totalFrames);
@@ -234,10 +279,15 @@ export default function Looper() {
         flattened.set(samples, writeAt);
         writeAt += samples.length;
       });
+      const loopData = new Float32Array(loopFrames);
       const readAt = Math.max(0, sourceStart);
       const destinationAt = Math.max(0, -sourceStart);
-      const available = Math.min(flattened.length - readAt, frameCount - destinationAt);
-      if (available > 0) buffer.copyToChannel(flattened.subarray(readAt, readAt + available), channel, destinationAt);
+      const available = Math.min(flattened.length - readAt, loopFrames - destinationAt);
+      if (available > 0) loopData.set(flattened.subarray(readAt, readAt + available), destinationAt);
+
+      buffer.copyToChannel(loopData.subarray(loopFrames - marginFrames), channel, 0);
+      buffer.copyToChannel(loopData, channel, marginFrames);
+      buffer.copyToChannel(loopData.subarray(0, marginFrames), channel, marginFrames + loopFrames);
     }
 
     audioBuffers.current.set(capture.trackId, buffer);
@@ -276,7 +326,7 @@ export default function Looper() {
         setNotice(`Recording Track ${id}…`);
       }, delaySeconds * 1000);
       const capture = { trackId: id, input, processor, silentGain, chunks: capturedChunks, targetTime, startTimer, stopTimer: 0 };
-      capture.stopTimer = window.setTimeout(() => finishCapture(capture, globalLatency), (delaySeconds + loopMs / 1000 + CAPTURE_MARGIN_SECONDS) * 1000);
+      capture.stopTimer = window.setTimeout(() => finishCapture(capture, globalLatency), (delaySeconds + loopMs / 1000) * 1000);
       activeCapture.current = capture;
       queuedTimers.current.set(id, startTimer);
     } catch {
@@ -366,14 +416,14 @@ export default function Looper() {
         <button className={`play ${playing ? "active" : ""}`} onClick={togglePlay} aria-label={playing ? "Pause loop" : "Start loop"}><Icon name={playing ? "pause" : "play"} size={23} /></button>
         <div className="tempo-control">
           <span className="control-label">TEMPO</span>
-          <div className="tempo-value"><button onClick={() => setBpm(Math.max(40, bpm - 1))}>−</button><strong>{bpm}</strong><small>BPM</small><button onClick={() => setBpm(Math.min(240, bpm + 1))}>+</button></div>
+          <div className="tempo-value"><button onClick={() => setBpm(Math.max(40, bpm - 1))}>−</button><EditableNumber value={bpm} onCommit={setBpm} min={40} max={240} label="Tempo in BPM" suffix="BPM" className="tempo-edit" /><button onClick={() => setBpm(Math.min(240, bpm + 1))}>+</button></div>
         </div>
         <div className="divider" />
         <label className="select-control"><span className="control-label">LOOP LENGTH</span><select value={bars} onChange={event => setBars(Number(event.target.value))} disabled={playing}><option value={1}>1 BAR</option><option value={2}>2 BARS</option><option value={4}>4 BARS</option><option value={8}>8 BARS</option><option value={16}>16 BARS</option></select></label>
         <div className="divider" />
         <div className="metro-control"><span className="control-label">METRONOME</span><div><button className={`toggle ${metronome ? "on" : ""}`} onClick={() => setMetronome(!metronome)} aria-label="Toggle metronome"><span /></button><Icon name="volume" /><input aria-label="Metronome volume" type="range" min="0" max="100" value={metroVolume} onChange={event => setMetroVolume(Number(event.target.value))} /></div></div>
         <div className="divider" />
-        <div className="latency-global"><span className="control-label">NEW TRACK LATENCY</span><div><button onClick={() => setGlobalLatency(value => clampLatency(value - LATENCY_STEP))} aria-label="Decrease global latency">−</button><strong>{globalLatency > 0 ? "+" : ""}{globalLatency}</strong><small>MS</small><button onClick={() => setGlobalLatency(value => clampLatency(value + LATENCY_STEP))} aria-label="Increase global latency">+</button></div></div>
+        <div className="latency-global"><span className="control-label">NEW TRACK LATENCY</span><div><button onClick={() => setGlobalLatency(value => clampLatency(value - LATENCY_STEP))} aria-label="Decrease global latency">−</button><EditableNumber value={globalLatency} onCommit={value => setGlobalLatency(clampLatency(value))} min={-LATENCY_LIMIT} max={LATENCY_LIMIT} label="New track latency in milliseconds" suffix="MS" signed className="latency-edit" /><button onClick={() => setGlobalLatency(value => clampLatency(value + LATENCY_STEP))} aria-label="Increase global latency">+</button></div></div>
       </section>
 
       <section className="workspace">
@@ -395,7 +445,7 @@ export default function Looper() {
                 <div className="track-info"><strong>{track.name}</strong><span>{track.status === "empty" ? "READY TO RECORD" : track.status.replace("-", " ").toUpperCase()}</span></div>
                 <div className="waveform" aria-hidden>{Array.from({ length: 52 }, (_, i) => <i key={i} style={{ height: empty ? 2 : `${18 + ((i * 17 + track.id * 11) % 42)}%` }} />)}</div>
                 {queued && <span className="queued-pill">NEXT BAR</span>}
-                {!empty && !queued && <div className="track-latency" aria-label={`Track ${track.id} latency`}><button onClick={() => nudgeTrack(track.id, -1)} aria-label={`Shift Track ${track.id} backward 5 milliseconds`}>−</button><span>{track.latencyMs > 0 ? "+" : ""}{track.latencyMs}<small>ms</small></span><button onClick={() => nudgeTrack(track.id, 1)} aria-label={`Shift Track ${track.id} forward 5 milliseconds`}>+</button></div>}
+                {!empty && !queued && <div className="track-latency" aria-label={`Track ${track.id} latency`}><button onClick={() => nudgeTrack(track.id, -1)} aria-label={`Shift Track ${track.id} backward 5 milliseconds`}>−</button><EditableNumber value={track.latencyMs} onCommit={value => setTrackLatency(track.id, value)} min={-LATENCY_LIMIT} max={LATENCY_LIMIT} label={`Track ${track.id} latency in milliseconds`} suffix="ms" signed className="track-latency-edit" /><button onClick={() => nudgeTrack(track.id, 1)} aria-label={`Shift Track ${track.id} forward 5 milliseconds`}>+</button></div>}
                 {!empty && <button className="mini-delete" onClick={() => { setDeleteMode(true); setDeleteTarget(track.id); }} aria-label={`Delete Track ${track.id}`}><Icon name="trash" size={17} /></button>}
                 <button className={`track-action ${track.status === "recording" ? "recording" : ""}`} onClick={() => handleTrackAction(track.id)}><span />{empty || track.status === "queued" || track.status === "recording" ? "REC" : muted ? "UNMUTE" : "MUTE"}</button>
               </article>
