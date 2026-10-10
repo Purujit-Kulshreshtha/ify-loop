@@ -3,12 +3,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type TrackStatus = "empty" | "queued" | "recording" | "playing" | "muted" | "mute-queued" | "unmute-queued";
-type Track = { id: number; name: string; status: TrackStatus; blobUrl?: string; duration?: number; latencyMs: number };
+type Track = { id: number; name: string; status: TrackStatus; hasRecording: boolean; duration?: number; latencyMs: number };
+type PlaybackNode = { source: AudioBufferSourceNode; gain: GainNode };
+type PcmChunk = { at: number; channels: Float32Array[] };
+type ActiveCapture = {
+  trackId: number;
+  input: MediaStreamAudioSourceNode;
+  processor: ScriptProcessorNode;
+  silentGain: GainNode;
+  chunks: PcmChunk[];
+  targetTime: number;
+  startTimer: number;
+  stopTimer: number;
+};
 
 const COLORS = ["#d8ff5f", "#ff7965", "#77d8ff", "#c5a1ff", "#ffca68", "#70e4b4", "#ff98cb", "#a8b6ff", "#e7f08a"];
 const INITIAL_TRACKS = 4;
 const LATENCY_STEP = 5;
 const LATENCY_LIMIT = 250;
+const CAPTURE_MARGIN_SECONDS = LATENCY_LIMIT / 1000;
 
 function Icon({ name, size = 18 }: { name: "play" | "pause" | "trash" | "plus" | "volume" | "mic"; size?: number }) {
   const paths = {
@@ -31,7 +44,7 @@ export default function Looper() {
   const [globalLatency, setGlobalLatency] = useState(0);
   const [beat, setBeat] = useState(0);
   const [bar, setBar] = useState(1);
-  const [tracks, setTracks] = useState<Track[]>(() => Array.from({ length: INITIAL_TRACKS }, (_, i) => ({ id: i + 1, name: `Track ${i + 1}`, status: "empty", latencyMs: 0 })));
+  const [tracks, setTracks] = useState<Track[]>(() => Array.from({ length: INITIAL_TRACKS }, (_, i) => ({ id: i + 1, name: `Track ${i + 1}`, status: "empty", hasRecording: false, latencyMs: 0 })));
   const [selectedTrack, setSelectedTrack] = useState<number | null>(null);
   const [deleteMode, setDeleteMode] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<number | null>(null);
@@ -40,12 +53,13 @@ export default function Looper() {
 
   const audioContext = useRef<AudioContext | null>(null);
   const stream = useRef<MediaStream | null>(null);
-  const recorder = useRef<MediaRecorder | null>(null);
-  const chunks = useRef<Blob[]>([]);
   const startTime = useRef(0);
+  const audioStartTime = useRef(0);
   const transportTimer = useRef<number | null>(null);
   const queuedTimers = useRef<Map<number, number>>(new Map());
-  const audioEls = useRef<Map<number, HTMLAudioElement>>(new Map());
+  const audioBuffers = useRef<Map<number, AudioBuffer>>(new Map());
+  const playbackNodes = useRef<Map<number, PlaybackNode>>(new Map());
+  const activeCapture = useRef<ActiveCapture | null>(null);
   const tracksRef = useRef(tracks);
   const playingRef = useRef(playing);
 
@@ -58,11 +72,6 @@ export default function Looper() {
 
   const clampLatency = useCallback((value: number) => Math.max(-LATENCY_LIMIT, Math.min(LATENCY_LIMIT, value)), []);
 
-  const playbackOffset = useCallback((latencyMs: number) => {
-    const elapsed = performance.now() - startTime.current;
-    return (((elapsed - latencyMs) % loopMs + loopMs) % loopMs) / 1000;
-  }, [loopMs]);
-
   const getContext = useCallback(() => {
     if (!audioContext.current) audioContext.current = new AudioContext();
     void audioContext.current.resume();
@@ -71,7 +80,9 @@ export default function Looper() {
 
   const nextBarDelay = useCallback(() => {
     if (!playingRef.current) return 0;
-    const elapsed = performance.now() - startTime.current;
+    const elapsed = audioContext.current
+      ? (audioContext.current.currentTime - audioStartTime.current) * 1000
+      : performance.now() - startTime.current;
     const position = elapsed % barMs;
     return Math.max(10, barMs - position);
   }, [barMs]);
@@ -106,62 +117,90 @@ export default function Looper() {
     click();
   }, [beat, getContext, metronome, metroVolume, playing]);
 
+  const stopPlaybackNode = useCallback((id: number) => {
+    const node = playbackNodes.current.get(id);
+    if (!node) return;
+    try { node.source.stop(); } catch { /* already stopped */ }
+    node.source.disconnect();
+    node.gain.disconnect();
+    playbackNodes.current.delete(id);
+  }, []);
+
+  const startTrackPlayback = useCallback((id: number, latencyOverride?: number) => {
+    const ctx = getContext();
+    const buffer = audioBuffers.current.get(id);
+    const track = tracksRef.current.find(item => item.id === id);
+    if (!buffer || !track || !playingRef.current) return;
+    stopPlaybackNode(id);
+    const latencyMs = latencyOverride ?? track.latencyMs;
+    const loopSeconds = loopMs / 1000;
+    const loopStart = CAPTURE_MARGIN_SECONDS - latencyMs / 1000;
+    const phase = ((ctx.currentTime - audioStartTime.current) % loopSeconds + loopSeconds) % loopSeconds;
+    const source = ctx.createBufferSource();
+    const gain = ctx.createGain();
+    source.buffer = buffer;
+    source.loop = true;
+    source.loopStart = loopStart;
+    source.loopEnd = loopStart + loopSeconds;
+    gain.gain.value = track.status === "muted" || track.status === "mute-queued" ? 0 : 1;
+    source.connect(gain).connect(ctx.destination);
+    source.start(0, loopStart + phase);
+    playbackNodes.current.set(id, { source, gain });
+  }, [getContext, loopMs, stopPlaybackNode]);
+
   const syncAudios = useCallback(() => {
-    tracksRef.current.forEach(track => {
-      const audio = audioEls.current.get(track.id);
-      if (!audio || !track.blobUrl) return;
-      audio.loop = true;
-      audio.currentTime = Math.min(playbackOffset(track.latencyMs), Math.max(0, (audio.duration || loopMs / 1000) - 0.02));
-      audio.muted = track.status === "muted" || track.status === "mute-queued";
-      void audio.play().catch(() => undefined);
-    });
-  }, [loopMs, playbackOffset]);
+    tracksRef.current.forEach(track => { if (track.hasRecording) startTrackPlayback(track.id); });
+  }, [startTrackPlayback]);
 
   const togglePlay = useCallback(() => {
-    getContext();
+    const ctx = getContext();
     setPlaying(value => {
       if (!value) {
         startTime.current = performance.now();
+        audioStartTime.current = ctx.currentTime;
         setBeat(0); setBar(1); setNotice("Loop running — actions land on the next bar");
         window.setTimeout(syncAudios, 0);
       } else {
-        audioEls.current.forEach(audio => audio.pause());
+        playbackNodes.current.forEach((_, id) => stopPlaybackNode(id));
         setNotice("Loop paused");
       }
       playingRef.current = !value;
       return !value;
     });
-  }, [getContext, syncAudios]);
+  }, [getContext, stopPlaybackNode, syncAudios]);
 
   const updateTrack = useCallback((id: number, patch: Partial<Track>) => {
-    setTracks(prev => prev.map(track => track.id === id ? { ...track, ...patch } : track));
+    setTracks(prev => {
+      const next = prev.map(track => track.id === id ? { ...track, ...patch } : track);
+      tracksRef.current = next;
+      return next;
+    });
   }, []);
 
   const nudgeTrack = useCallback((id: number, direction: -1 | 1) => {
     const track = tracksRef.current.find(item => item.id === id);
-    if (!track?.blobUrl) { setNotice(`Record Track ${id} before adjusting its latency`); return; }
+    if (!track?.hasRecording) { setNotice(`Record Track ${id} before adjusting its latency`); return; }
     const latencyMs = clampLatency(track.latencyMs + direction * LATENCY_STEP);
     updateTrack(id, { latencyMs });
     setSelectedTrack(id);
-    const audio = audioEls.current.get(id);
-    if (audio && playingRef.current) audio.currentTime = Math.min(playbackOffset(latencyMs), Math.max(0, (audio.duration || loopMs / 1000) - 0.02));
+    if (playingRef.current) startTrackPlayback(id, latencyMs);
     setNotice(`Track ${id} latency ${latencyMs > 0 ? "+" : ""}${latencyMs} ms`);
-  }, [clampLatency, loopMs, playbackOffset, updateTrack]);
+  }, [clampLatency, startTrackPlayback, updateTrack]);
 
   const queueMuteToggle = useCallback((id: number) => {
     const track = tracksRef.current.find(item => item.id === id);
-    if (!track || !track.blobUrl) return;
+    if (!track || !track.hasRecording) return;
     const willMute = track.status !== "muted" && track.status !== "mute-queued";
     updateTrack(id, { status: willMute ? "mute-queued" : "unmute-queued" });
     setNotice(`${willMute ? "Mute" : "Unmute"} queued for Track ${id}`);
     const timer = window.setTimeout(() => {
-      const audio = audioEls.current.get(id);
-      if (audio) audio.muted = willMute;
+      const node = playbackNodes.current.get(id);
+      if (node) node.gain.gain.setValueAtTime(willMute ? 0 : 1, getContext().currentTime);
       updateTrack(id, { status: willMute ? "muted" : "playing" });
       setNotice(`Track ${id} ${willMute ? "muted" : "playing"}`);
     }, nextBarDelay());
     queuedTimers.current.set(id, timer);
-  }, [nextBarDelay, updateTrack]);
+  }, [getContext, nextBarDelay, updateTrack]);
 
   const ensureMic = useCallback(async () => {
     if (!stream.current) stream.current = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
@@ -169,57 +208,94 @@ export default function Looper() {
     return stream.current;
   }, []);
 
+  const finishCapture = useCallback((capture: ActiveCapture, latencyMs: number) => {
+    if (activeCapture.current !== capture) return;
+    capture.processor.onaudioprocess = null;
+    capture.input.disconnect();
+    capture.processor.disconnect();
+    capture.silentGain.disconnect();
+    activeCapture.current = null;
+
+    const ctx = getContext();
+    const sampleRate = ctx.sampleRate;
+    const loopSeconds = loopMs / 1000;
+    const frameCount = Math.round((loopSeconds + CAPTURE_MARGIN_SECONDS * 2) * sampleRate);
+    const channelCount = capture.chunks[0]?.channels.length || 1;
+    const buffer = ctx.createBuffer(channelCount, frameCount, sampleRate);
+    const totalFrames = capture.chunks.reduce((sum, chunk) => sum + chunk.channels[0].length, 0);
+    const firstTime = capture.chunks[0]?.at ?? capture.targetTime;
+    const sourceStart = Math.round((capture.targetTime - CAPTURE_MARGIN_SECONDS - firstTime) * sampleRate);
+
+    for (let channel = 0; channel < channelCount; channel += 1) {
+      const flattened = new Float32Array(totalFrames);
+      let writeAt = 0;
+      capture.chunks.forEach(chunk => {
+        const samples = chunk.channels[Math.min(channel, chunk.channels.length - 1)];
+        flattened.set(samples, writeAt);
+        writeAt += samples.length;
+      });
+      const readAt = Math.max(0, sourceStart);
+      const destinationAt = Math.max(0, -sourceStart);
+      const available = Math.min(flattened.length - readAt, frameCount - destinationAt);
+      if (available > 0) buffer.copyToChannel(flattened.subarray(readAt, readAt + available), channel, destinationAt);
+    }
+
+    audioBuffers.current.set(capture.trackId, buffer);
+    updateTrack(capture.trackId, { status: "playing", hasRecording: true, duration: loopSeconds, latencyMs });
+    setSelectedTrack(capture.trackId);
+    if (playingRef.current) startTrackPlayback(capture.trackId, latencyMs);
+    setNotice(`Track ${capture.trackId} trimmed to the bar and looping`);
+  }, [getContext, loopMs, startTrackPlayback, updateTrack]);
+
   const queueRecord = useCallback(async (id: number) => {
     const track = tracksRef.current.find(item => item.id === id);
     if (!playingRef.current) { setNotice("Start the loop before recording"); return; }
     if (!track) return;
-    if (track.blobUrl || track.status !== "empty") { queueMuteToggle(id); return; }
+    if (track.hasRecording || track.status !== "empty") { queueMuteToggle(id); return; }
+    if (activeCapture.current) { setNotice(`Finish recording Track ${activeCapture.current.trackId} first`); return; }
     try {
       const mic = await ensureMic();
+      const ctx = getContext();
+      const delaySeconds = nextBarDelay() / 1000;
+      const targetTime = ctx.currentTime + delaySeconds;
+      const input = ctx.createMediaStreamSource(mic);
+      const processor = ctx.createScriptProcessor(2048, 2, 2);
+      const silentGain = ctx.createGain();
+      const capturedChunks: PcmChunk[] = [];
+      silentGain.gain.value = 0;
+      processor.onaudioprocess = event => {
+        const channels = Array.from({ length: event.inputBuffer.numberOfChannels }, (_, channel) => new Float32Array(event.inputBuffer.getChannelData(channel)));
+        capturedChunks.push({ at: event.playbackTime, channels });
+      };
+      input.connect(processor);
+      processor.connect(silentGain).connect(ctx.destination);
       updateTrack(id, { status: "queued" });
-      setNotice(`Track ${id} armed — recording starts next bar`);
-      const timer = window.setTimeout(() => {
-        chunks.current = [];
-        const mediaRecorder = new MediaRecorder(mic);
-        recorder.current = mediaRecorder;
-        mediaRecorder.ondataavailable = event => { if (event.data.size) chunks.current.push(event.data); };
-        mediaRecorder.onstop = () => {
-          const blob = new Blob(chunks.current, { type: mediaRecorder.mimeType });
-          const blobUrl = URL.createObjectURL(blob);
-          const audio = new Audio(blobUrl);
-          audio.loop = true;
-          audioEls.current.set(id, audio);
-          updateTrack(id, { status: "playing", blobUrl, duration: loopMs / 1000, latencyMs: globalLatency });
-          setSelectedTrack(id);
-          audio.currentTime = Math.min(playbackOffset(globalLatency), Math.max(0, loopMs / 1000 - 0.02));
-          void audio.play().catch(() => undefined);
-          setNotice(`Track ${id} captured and looping`);
-        };
-        mediaRecorder.start();
+      setNotice(`Capturing Track ${id} pre-roll — loop begins next bar`);
+      const startTimer = window.setTimeout(() => {
         updateTrack(id, { status: "recording" });
         setNotice(`Recording Track ${id}…`);
-        window.setTimeout(() => { if (mediaRecorder.state === "recording") mediaRecorder.stop(); }, loopMs);
-      }, nextBarDelay());
-      queuedTimers.current.set(id, timer);
+      }, delaySeconds * 1000);
+      const capture = { trackId: id, input, processor, silentGain, chunks: capturedChunks, targetTime, startTimer, stopTimer: 0 };
+      capture.stopTimer = window.setTimeout(() => finishCapture(capture, globalLatency), (delaySeconds + loopMs / 1000 + CAPTURE_MARGIN_SECONDS) * 1000);
+      activeCapture.current = capture;
+      queuedTimers.current.set(id, startTimer);
     } catch {
       setNotice("Microphone access is needed to record");
     }
-  }, [ensureMic, globalLatency, loopMs, nextBarDelay, playbackOffset, queueMuteToggle, updateTrack]);
+  }, [ensureMic, finishCapture, getContext, globalLatency, loopMs, nextBarDelay, queueMuteToggle, updateTrack]);
 
   const deleteTrack = useCallback((id: number) => {
-    const old = tracksRef.current.find(item => item.id === id);
-    if (old?.blobUrl) URL.revokeObjectURL(old.blobUrl);
-    const audio = audioEls.current.get(id);
-    if (audio) { audio.pause(); audioEls.current.delete(id); }
-    updateTrack(id, { status: "empty", blobUrl: undefined, duration: undefined, latencyMs: 0 });
+    stopPlaybackNode(id);
+    audioBuffers.current.delete(id);
+    updateTrack(id, { status: "empty", hasRecording: false, duration: undefined, latencyMs: 0 });
     setSelectedTrack(current => current === id ? null : current);
     setDeleteTarget(null); setDeleteMode(false); setNotice(`Track ${id} cleared`);
-  }, [updateTrack]);
+  }, [stopPlaybackNode, updateTrack]);
 
   const handleTrackAction = useCallback((id: number) => {
     if (deleteMode) {
       const target = tracksRef.current.find(item => item.id === id);
-      if (target?.blobUrl) { setDeleteTarget(id); setNotice(`Press Enter to clear Track ${id}`); }
+      if (target?.hasRecording) { setDeleteTarget(id); setNotice(`Press Enter to clear Track ${id}`); }
       return;
     }
     void queueRecord(id);
@@ -227,15 +303,19 @@ export default function Looper() {
 
   const fullMute = useCallback(() => {
     if (!playingRef.current) { setNotice("Start the loop before queuing a full mute"); return; }
-    const occupied = tracksRef.current.filter(track => track.blobUrl);
+    const occupied = tracksRef.current.filter(track => track.hasRecording);
     if (!occupied.length) { setNotice("There are no recorded tracks to mute"); return; }
     occupied.forEach(track => updateTrack(track.id, { status: "mute-queued" }));
     setNotice("Full mute queued for the next bar");
     window.setTimeout(() => {
-      occupied.forEach(track => { const audio = audioEls.current.get(track.id); if (audio) audio.muted = true; updateTrack(track.id, { status: "muted" }); });
+      occupied.forEach(track => {
+        const node = playbackNodes.current.get(track.id);
+        if (node) node.gain.gain.setValueAtTime(0, getContext().currentTime);
+        updateTrack(track.id, { status: "muted" });
+      });
       setNotice("All tracks muted — loop is still running");
     }, nextBarDelay());
-  }, [nextBarDelay, updateTrack]);
+  }, [getContext, nextBarDelay, updateTrack]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -261,7 +341,15 @@ export default function Looper() {
   useEffect(() => () => {
     stream.current?.getTracks().forEach(track => track.stop());
     queuedTimers.current.forEach(timer => window.clearTimeout(timer));
-    audioEls.current.forEach(audio => audio.pause());
+    if (activeCapture.current) {
+      window.clearTimeout(activeCapture.current.startTimer);
+      window.clearTimeout(activeCapture.current.stopTimer);
+      activeCapture.current.processor.onaudioprocess = null;
+      activeCapture.current.input.disconnect();
+      activeCapture.current.processor.disconnect();
+      activeCapture.current.silentGain.disconnect();
+    }
+    playbackNodes.current.forEach(node => { try { node.source.stop(); } catch { /* already stopped */ } });
   }, []);
 
   const loopProgress = useMemo(() => ((bar - 1) * 4 + beat + 1) / (bars * 4) * 100, [bar, bars, beat]);
@@ -315,7 +403,7 @@ export default function Looper() {
           })}
         </div>
 
-        {tracks.length < 9 && <button className="add-track" onClick={() => setTracks(prev => [...prev, { id: prev.length + 1, name: `Track ${prev.length + 1}`, status: "empty", latencyMs: 0 }])}><Icon name="plus" /> ADD TRACK <span>{tracks.length}/9</span></button>}
+        {tracks.length < 9 && <button className="add-track" onClick={() => setTracks(prev => [...prev, { id: prev.length + 1, name: `Track ${prev.length + 1}`, status: "empty", hasRecording: false, latencyMs: 0 }])}><Icon name="plus" /> ADD TRACK <span>{tracks.length}/9</span></button>}
       </section>
 
       <footer>

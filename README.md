@@ -22,6 +22,8 @@ Open [http://localhost:3000](http://localhost:3000). Microphone access is reques
 
 Record, mute, unmute, and full-mute actions are quantized to the next bar. Recordings run for the selected loop length, while muted audio keeps its place in the transport.
 
+Recording starts capturing raw Web Audio samples as soon as a track is armed. The next bar is timestamped on the audio clock, and the finished take is trimmed to that exact sample boundary with a small pre/post-roll margin. This avoids encoded-audio padding and keeps latency adjustments phase-locked.
+
 The global latency control sets the starting offset for every new recording. Each recorded track can then be selected and fine-tuned independently from −250 ms to +250 ms using its on-screen controls or the arrow keys.
 
 ## Checks
