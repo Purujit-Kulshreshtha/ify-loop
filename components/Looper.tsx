@@ -22,7 +22,7 @@ type ActiveCapture = {
   stopTimer: number;
 };
 
-const COLORS = ["#d8ff5f", "#ff7965", "#77d8ff", "#c5a1ff", "#ffca68", "#70e4b4", "#ff98cb", "#a8b6ff", "#e7f08a"];
+const COLORS = ["#27e6c1", "#5ff0d4", "#20c9aa", "#8cf7e1", "#16ad92", "#b7fff0", "#3ddbbd", "#75e8d1", "#2fc7ac"];
 const INITIAL_TRACKS = 4;
 const LATENCY_STEP = 5;
 const LATENCY_LIMIT = 250;
